@@ -69,10 +69,10 @@ jobs:
 
       - name: Show Tailscale IP and tmate info
         run: |
-          echo "ðŸ”— Tailscale IP:"
+          echo "🔗 Tailscale IP:"
           tailscale ip -4 || echo "Tailscale IP not found"
           echo ""
-          echo "ðŸ”‘ tmate SSH session:"
+          echo "🔑 tmate SSH session:"
           cat $HOME/.tmate.sock/ssh
 
       - name: Sleep to keep VPS alive
@@ -90,12 +90,3 @@ jobs:
         with:
           name: vps-backup
           path: backup.zip
-
-
-TAILSCALE_AUTHKEY
-your key inside it 
-
-https://github.com/How2MCoffc/Get-SSL-at-localhost
-
-
-https://pterodactyl.io/
