@@ -1,21 +1,18 @@
 name: Continuous Persistent VPS
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *" # fallback trigger every 6h if needed
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # Just under 6 hours
+    timeout-minutes: 330  # 5h30m
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Set hostname to biralo
-        run: sudo hostnamectl set-hostname biralo
 
       - name: Download VPS backup (if any)
         uses: actions/download-artifact@v4
@@ -76,12 +73,12 @@ jobs:
           cat $HOME/.tmate.sock/ssh
 
       - name: Sleep to keep VPS alive
-        run: sleep 21600  # 6 hours
+        run: sleep 19800  # 5h30m
 
       - name: Backup VPS data and tailscale state
         run: |
           sudo mkdir -p /opt/vps-backup/data
-          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
           sudo chown -R $USER:$USER /opt/vps-backup
           zip -r backup.zip /opt/vps-backup
 
@@ -90,3 +87,9 @@ jobs:
         with:
           name: vps-backup
           path: backup.zip
+
+      - name: Re-dispatch workflow for auto-restart
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "Continuous Persistent VPS"
