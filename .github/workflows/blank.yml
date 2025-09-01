@@ -1,18 +1,21 @@
 name: Continuous Persistent VPS
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *" # fallback trigger every 6h if needed
+    - cron: '0 */6 * * *'   # fallback trigger every 6 hours
+  workflow_dispatch:
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 330  # 5h30m
+    timeout-minutes: 330   # 5h30m max runtime
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Set hostname to biralo
+        run: sudo hostnamectl set-hostname biralo
 
       - name: Download VPS backup (if any)
         uses: actions/download-artifact@v4
@@ -24,16 +27,38 @@ jobs:
       - name: Install prerequisites
         run: |
           sudo apt update
-          sudo apt install -y tmate curl unzip sudo net-tools neofetch
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch rsync zip
 
       - name: Install Tailscale official script
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Restore backup files
+      - name: Restore full VPS backup
         run: |
           if [ -f ./backup/backup.zip ]; then
-            unzip -o ./backup/backup.zip -d /
+            echo "Restoring full VPS..."
+            sudo unzip -o ./backup/backup.zip -d /
+
+            # Reload services
+            sudo systemctl daemon-reexec || true
+            sudo systemctl daemon-reload || true
+
+            # Restart all enabled services
+            for svc in $(systemctl list-unit-files --state=enabled --no-pager --no-legend | awk '{print $1}'); do
+              sudo systemctl restart "$svc" || true
+            done
+
+            # Restart only containers that were running before backup
+            if command -v docker >/dev/null 2>&1; then
+              sudo systemctl restart docker || true
+              sleep 5
+              if [ -f /opt/vps-backup/data/running-containers.list ]; then
+                echo "Restoring Docker containers..."
+                for c in $(cat /opt/vps-backup/data/running-containers.list); do
+                  sudo docker start "$c" || true
+                done
+              fi
+            fi
           else
             echo "No backup found, starting fresh"
           fi
@@ -64,32 +89,42 @@ jobs:
       - name: Start tmate session for SSH access
         uses: mxschmitt/action-tmate@v3
 
-      - name: Show Tailscale IP and tmate info
+      - name: Show Tailscale IP
         run: |
           echo "🔗 Tailscale IP:"
           tailscale ip -4 || echo "Tailscale IP not found"
-          echo ""
-          echo "🔑 tmate SSH session:"
-          cat $HOME/.tmate.sock/ssh
 
-      - name: Sleep to keep VPS alive
-        run: sleep 19800  # 5h30m
+      - name: Sleep until restart
+        run: sleep 19800   # 5h30m (19800s)
 
-      - name: Backup VPS data and tailscale state
+      - name: Backup full VPS filesystem
         run: |
           sudo mkdir -p /opt/vps-backup/data
           sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
-          sudo chown -R $USER:$USER /opt/vps-backup
-          zip -r backup.zip /opt/vps-backup
+
+          # Save running container list
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker ps -q > /opt/vps-backup/data/running-containers.list || true
+          fi
+
+          echo "Creating full backup..."
+          sudo rsync -aAX \
+            --exclude={"/opt/vps-backup","/proc/*","/sys/*","/dev/*","/tmp/*","/run/*"} \
+            / /opt/vps-backup/full
+
+          cd /
+          sudo zip -r /backup.zip opt/vps-backup
 
       - name: Upload VPS backup artifact
         uses: actions/upload-artifact@v4
         with:
           name: vps-backup
-          path: backup.zip
+          path: /backup.zip
+          retention-days: 90
 
-      - name: Re-dispatch workflow for auto-restart
+      - name: Auto-dispatch next run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run "Continuous Persistent VPS"
+          echo "Triggering next run..."
+          gh workflow run "Continuous Persistent VPS" || true
