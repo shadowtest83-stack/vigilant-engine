@@ -1,43 +1,49 @@
-name: Continuous VPS (GitHub-Hosted)
+name: Continuous VPS (Artifact-Based)
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger
   schedule:
-    - cron: "30 */5 * * *"  # every 5h30m (UTC approx)
+    - cron: "30 */5 * * *"  # ~5h30m auto-restart
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
+
     steps:
     # 1. Checkout repo
-    - name: Checkout repo
+    - name: Checkout repository
       uses: actions/checkout@v4
 
     # 2. Install prerequisites
     - name: Install prerequisites
       run: |
         sudo apt update && sudo apt upgrade -y
-        sudo apt install -y curl unzip zip rsync wget docker.io docker-compose awscli
+        sudo apt install -y curl unzip zip rsync wget docker.io docker-compose
 
-    # 3. Restore backup from S3
-    - name: Download backup
+    # 3. Install Tailscale
+    - name: Install Tailscale
       run: |
-        mkdir -p ./backup
-        aws s3 cp s3://YOUR_BUCKET_NAME/backup.zip ./backup/backup.zip || echo "No backup found"
+        curl -fsSL https://tailscale.com/install.sh | sh
 
-    - name: Extract backup
+    # 4. Restore backup from artifact
+    - name: Download VPS backup
+      uses: actions/download-artifact@v4
+      with:
+        name: vps-backup
+        path: ./backup || echo "No previous backup found"
+
+    - name: Extract Backup
       run: |
         if [ -f ./backup/backup.zip ]; then
           unzip -o ./backup/backup.zip -d /opt/vps-backup
         fi
 
-    # 4. Install & connect Tailscale
-    - name: Install Tailscale
+    # 5. Connect Tailscale
+    - name: Connect Tailscale
       run: |
-        curl -fsSL https://tailscale.com/install.sh | sh
         sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname gha-vps --accept-routes --accept-dns --ssh || echo "Tailscale may already be up"
 
-    # 5. Start Playit agent
+    # 6. Start Playit agent
     - name: Start Playit
       run: |
         if [ ! -f ./playit-linux ]; then
@@ -48,25 +54,31 @@ jobs:
         cp -r /opt/vps-backup/data/playit/* ~/.playit/ || true
         nohup ./playit-linux &>/dev/null &
 
-    # 6. Start Docker containers
+    # 7. Start Docker containers
     - name: Start Docker containers
       run: |
         if [ -f docker-compose.yml ]; then
           docker-compose up -d
         fi
 
-    # 7. Show IPs
+    # 8. Show IPs
     - name: Show IPs
       run: |
         echo "Public IP via Playit:"
         cat ~/.playit/public-ip.txt || echo "Not found"
         echo "Tailscale IP:"
         tailscale ip -4
+        docker ps
 
-    # 8. Backup VPS to S3
+    # 9. Backup VPS for next run
     - name: Backup VPS
       run: |
         mkdir -p /opt/vps-backup/data/playit
         cp -r ~/.playit/* /opt/vps-backup/data/playit/ || true
         zip -r backup.zip /opt/vps-backup
-        aws s3 cp backup.zip s3://YOUR_BUCKET_NAME/backup.zip
+
+    - name: Upload VPS backup artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: vps-backup
+        path: backup.zip
