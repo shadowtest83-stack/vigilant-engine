@@ -2,19 +2,19 @@ name: Continuous Persistent VPS
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # fallback trigger every 6 hours
+    - cron: '*/355 * * * *'   # every ~5h55m
   workflow_dispatch:
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 330   # 5h30m max runtime
+    timeout-minutes: 355   # <6h limit
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set hostname to biralo
+      - name: Set hostname
         run: sudo hostnamectl set-hostname biralo
 
       - name: Download VPS backup (if any)
@@ -27,37 +27,37 @@ jobs:
       - name: Install prerequisites
         run: |
           sudo apt update
-          sudo apt install -y tmate curl unzip sudo net-tools neofetch rsync zip
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch rsync zip \
+                              docker.io docker-compose
+          sudo systemctl enable docker
+          sudo systemctl start docker
 
-      - name: Install Tailscale official script
+      - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Restore full VPS backup
+      - name: Restore VPS backup
         run: |
           if [ -f ./backup/backup.zip ]; then
-            echo "Restoring full VPS..."
+            echo "Restoring VPS..."
             sudo unzip -o ./backup/backup.zip -d /
 
             # Reload services
             sudo systemctl daemon-reexec || true
             sudo systemctl daemon-reload || true
 
-            # Restart all enabled services
+            # Restart enabled services
             for svc in $(systemctl list-unit-files --state=enabled --no-pager --no-legend | awk '{print $1}'); do
               sudo systemctl restart "$svc" || true
             done
 
-            # Restart only containers that were running before backup
-            if command -v docker >/dev/null 2>&1; then
+            # Restore Docker running containers
+            if [ -f /opt/vps-backup/data/running-containers.list ]; then
               sudo systemctl restart docker || true
               sleep 5
-              if [ -f /opt/vps-backup/data/running-containers.list ]; then
-                echo "Restoring Docker containers..."
-                for c in $(cat /opt/vps-backup/data/running-containers.list); do
-                  sudo docker start "$c" || true
-                done
-              fi
+              for c in $(cat /opt/vps-backup/data/running-containers.list); do
+                sudo docker start "$c" || true
+              done
             fi
           else
             echo "No backup found, starting fresh"
@@ -82,32 +82,30 @@ jobs:
           if ! id -u biralo >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash biralo
             echo "biralo:biralo" | sudo chpasswd
-            sudo usermod -aG sudo biralo
+            sudo usermod -aG sudo,docker biralo
             echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
           fi
 
-      - name: Start tmate session for SSH access
+      - name: Start tmate session (SSH)
         uses: mxschmitt/action-tmate@v3
 
       - name: Show Tailscale IP
         run: |
           echo "🔗 Tailscale IP:"
-          tailscale ip -4 || echo "Tailscale IP not found"
+          tailscale ip -4 || echo "No Tailscale IP found"
 
-      - name: Sleep until restart
-        run: sleep 19800   # 5h30m (19800s)
+      - name: Sleep until backup
+        run: sleep 21000   # ~5h50m
 
-      - name: Backup full VPS filesystem
+      - name: Create VPS backup
         run: |
           sudo mkdir -p /opt/vps-backup/data
           sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
 
-          # Save running container list
-          if command -v docker >/dev/null 2>&1; then
-            sudo docker ps -q > /opt/vps-backup/data/running-containers.list || true
-          fi
+          # Save running containers
+          sudo docker ps -q > /opt/vps-backup/data/running-containers.list || true
 
-          echo "Creating full backup..."
+          echo "Backing up filesystem..."
           sudo rsync -aAX \
             --exclude={"/opt/vps-backup","/proc/*","/sys/*","/dev/*","/tmp/*","/run/*"} \
             / /opt/vps-backup/full
@@ -116,15 +114,9 @@ jobs:
           sudo zip -r /backup.zip opt/vps-backup
 
       - name: Upload VPS backup artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vps-backup
           path: /backup.zip
           retention-days: 90
-
-      - name: Auto-dispatch next run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Triggering next run..."
-          gh workflow run "Continuous Persistent VPS" || true
