@@ -1,26 +1,25 @@
 name: Continuous Persistent VPS
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:  # manual trigger
+  schedule:
+    - cron: "30 */5 * * *"  # every 5 hours 30 minutes (UTC approximation)
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-
     steps:
-    # 1. Checkout repo (optional, for workflow scripts)
+    # 1. Checkout repo
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    # 2. Update system & install prerequisites
+    # 2. Install prerequisites
     - name: Install prerequisites
       run: |
         sudo apt update && sudo apt upgrade -y
-        sudo apt install -y curl unzip zip rsync sudo net-tools software-properties-common apt-transport-https ca-certificates gnupg lsb-release
+        sudo apt install -y curl unzip zip rsync sudo net-tools software-properties-common apt-transport-https ca-certificates gnupg lsb-release wget
 
-    # 3. Install Docker (stable)
+    # 3. Install Docker
     - name: Install Docker
       run: |
         sudo apt-get remove -y containerd containerd.io || true
@@ -31,40 +30,41 @@ jobs:
         sudo systemctl enable docker
         sudo systemctl start docker
 
-    # 4. Install Tailscale
-    - name: Install Tailscale
-      run: |
-        curl -fsSL https://tailscale.com/install.sh | sh
-        sudo tailscale up --authkey ${TAILSCALE_AUTHKEY:-""} || echo "Use manual auth if key not set"
-
-    # 5. Restore VPS backup (auto)
-    - name: Restore Backup
+    # 4. Restore VPS backup (must come before Tailscale/Playit)
+    - name: Download Backup
       uses: actions/download-artifact@v4
       with:
         name: vps-backup
-        path: ./backup.zip
+        path: ./backup
 
     - name: Extract Backup
       run: |
-        if [ -f ./backup.zip ]; then
-          unzip -o ./backup.zip -d /opt/vps-backup
+        if [ -f ./backup/backup.zip ]; then
+          unzip -o ./backup/backup.zip -d /opt/vps-backup
         fi
 
-    # 6. Start Playit (auto-start with claimed port)
+    # 5. Install & Connect Tailscale
+    - name: Install Tailscale
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up \
+          --authkey ${{ secrets.TAILSCALE_AUTHKEY }} \
+          --hostname gha-vps \
+          --accept-routes \
+          --accept-dns \
+          --ssh || echo "Tailscale may already be connected"
+
+    # 6. Start Playit agent
     - name: Start Playit agent
       run: |
-        # Download Playit agent if missing
         if [ ! -f ./playit-linux ]; then
           wget https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux
           chmod +x ./playit-linux
         fi
-
-        # Restore Playit config if exists
         if [ -d /opt/vps-backup/data/playit ]; then
-          cp -r /opt/vps-backup/data/playit ~/.playit
+          mkdir -p ~/.playit
+          cp -r /opt/vps-backup/data/playit/* ~/.playit/
         fi
-
-        # Start Playit in background
         nohup ./playit-linux &>/dev/null &
 
     # 7. Start Docker containers
@@ -74,7 +74,7 @@ jobs:
           docker compose up -d
         fi
 
-    # 8. Show public IPs
+    # 8. Show IPs for debug
     - name: Show IPs
       run: |
         echo "Public IPv4 via Playit:"
@@ -82,12 +82,13 @@ jobs:
         echo "Tailscale IP:"
         tailscale ip -4
 
-    # 9. Auto-backup VPS state
+    # 9. Backup VPS state for next run
     - name: Backup VPS
       run: |
         mkdir -p /opt/vps-backup/data/playit
         cp -r ~/.playit/* /opt/vps-backup/data/playit/ || true
         zip -r backup.zip /opt/vps-backup
+
     - name: Upload Backup
       uses: actions/upload-artifact@v4
       with:
