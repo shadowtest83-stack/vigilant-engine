@@ -1,110 +1,95 @@
 name: Continuous Persistent VPS
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours auto
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # Just under 6 hours
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    # 1. Checkout repo (optional, for workflow scripts)
+    - name: Checkout repo
+      uses: actions/checkout@v4
 
-      - name: Set hostname
-        run: sudo hostnamectl set-hostname biralo
+    # 2. Update system & install prerequisites
+    - name: Install prerequisites
+      run: |
+        sudo apt update && sudo apt upgrade -y
+        sudo apt install -y curl unzip zip rsync sudo net-tools software-properties-common apt-transport-https ca-certificates gnupg lsb-release
 
-      - name: Install prerequisites
-        run: |
-          sudo apt update
-          sudo apt install -y curl unzip sudo net-tools neofetch rsync zip software-properties-common \
-          apt-transport-https ca-certificates gnupg lsb-release
+    # 3. Install Docker (stable)
+    - name: Install Docker
+      run: |
+        sudo apt-get remove -y containerd containerd.io || true
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        sudo apt update
+        sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        sudo systemctl enable docker
+        sudo systemctl start docker
 
-      - name: Install Docker and systemd
-        run: |
-          sudo mkdir -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          sudo apt update
-          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-          sudo systemctl enable docker
-          sudo systemctl start docker
+    # 4. Install Tailscale
+    - name: Install Tailscale
+      run: |
+        curl -fsSL https://tailscale.com/install.sh | sh
+        sudo tailscale up --authkey ${TAILSCALE_AUTHKEY:-""} || echo "Use manual auth if key not set"
 
-      - name: Restore VPS backup if exists
-        uses: actions/download-artifact@v4
-        with:
-          name: vps-backup
-          path: ./backup
-        continue-on-error: true
+    # 5. Restore VPS backup (auto)
+    - name: Restore Backup
+      uses: actions/download-artifact@v4
+      with:
+        name: vps-backup
+        path: ./backup.zip
 
-      - name: Restore files
-        run: |
-          if [ -f ./backup/backup.zip ]; then
-            unzip -o ./backup/backup.zip -d /
-          else
-            echo "No backup found, starting fresh"
-          fi
+    - name: Extract Backup
+      run: |
+        if [ -f ./backup.zip ]; then
+          unzip -o ./backup.zip -d /opt/vps-backup
+        fi
 
-      - name: Install Tailscale official script
-        run: curl -fsSL https://tailscale.com/install.sh | sh
+    # 6. Start Playit (auto-start with claimed port)
+    - name: Start Playit agent
+      run: |
+        # Download Playit agent if missing
+        if [ ! -f ./playit-linux ]; then
+          wget https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux
+          chmod +x ./playit-linux
+        fi
 
-      - name: Restore Tailscale state if exists
-        run: |
-          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
-            sudo mkdir -p /var/lib/tailscale
-            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
-            sudo chmod 600 /var/lib/tailscale/tailscaled.state
-          fi
+        # Restore Playit config if exists
+        if [ -d /opt/vps-backup/data/playit ]; then
+          cp -r /opt/vps-backup/data/playit ~/.playit
+        fi
 
-      - name: Start Tailscale
-        run: |
-          sudo tailscaled &
-          sleep 8
-          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo || echo "Tailscale already up"
+        # Start Playit in background
+        nohup ./playit-linux &>/dev/null &
 
-      - name: Create user biralo with sudo
-        run: |
-          if ! id -u biralo >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash biralo
-            echo "biralo:biralo" | sudo chpasswd
-            sudo usermod -aG sudo biralo
-            echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
-          fi
+    # 7. Start Docker containers
+    - name: Start Docker containers
+      run: |
+        if [ -f docker-compose.yml ]; then
+          docker compose up -d
+        fi
 
-      - name: Start tmate session for SSH access
-        uses: mxschmitt/action-tmate@v3
+    # 8. Show public IPs
+    - name: Show IPs
+      run: |
+        echo "Public IPv4 via Playit:"
+        cat ~/.playit/public-ip.txt || echo "Playit IP not found"
+        echo "Tailscale IP:"
+        tailscale ip -4
 
-      - name: Show Tailscale IP and tmate info
-        run: |
-          echo "🖧 Tailscale IP:"
-          tailscale ip -4 || echo "Tailscale IP not found"
-          echo ""
-          echo "🔗 tmate SSH session:"
-          cat $HOME/.tmate.sock/ssh
-
-      - name: Keep VPS alive and auto-restart
-        run: |
-          while true; do
-            echo "🔄 Keeping VPS alive..."
-            sleep 19800  # 5h30m before restart
-            echo "♻️ Restarting services..."
-            sudo systemctl restart docker || true
-            sudo tailscaled || true
-            sleep 10
-          done
-
-      - name: Backup VPS data and Tailscale state
-        run: |
-          sudo mkdir -p /opt/vps-backup/data
-          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
-          sudo chown -R $USER:$USER /opt/vps-backup
-          zip -r backup.zip /opt/vps-backup || true
-
-      - name: Upload VPS backup artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: vps-backup
-          path: backup.zip
+    # 9. Auto-backup VPS state
+    - name: Backup VPS
+      run: |
+        mkdir -p /opt/vps-backup/data/playit
+        cp -r ~/.playit/* /opt/vps-backup/data/playit/ || true
+        zip -r backup.zip /opt/vps-backup
+    - name: Upload Backup
+      uses: actions/upload-artifact@v4
+      with:
+        name: vps-backup
+        path: backup.zip
