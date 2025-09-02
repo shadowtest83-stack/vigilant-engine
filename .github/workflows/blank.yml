@@ -2,13 +2,13 @@ name: Continuous Persistent VPS
 
 on:
   schedule:
-    - cron: '*/355 * * * *'   # every ~5h55m
+    - cron: '*/355 * * * *'
   workflow_dispatch:
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # <6h limit
+    timeout-minutes: 355
 
     steps:
       - name: Checkout repo
@@ -29,8 +29,8 @@ jobs:
           sudo apt update
           sudo apt install -y tmate curl unzip sudo net-tools neofetch rsync zip \
                               docker.io docker-compose
-          sudo systemctl enable docker
-          sudo systemctl start docker
+          sudo systemctl enable docker || true
+          sudo systemctl start docker || true
 
       - name: Install Tailscale
         run: |
@@ -46,18 +46,18 @@ jobs:
             sudo systemctl daemon-reexec || true
             sudo systemctl daemon-reload || true
 
-            # Restart enabled services
+            # Restart enabled services safely
             for svc in $(systemctl list-unit-files --state=enabled --no-pager --no-legend | awk '{print $1}'); do
               sudo systemctl restart "$svc" || true
             done
 
             # Restore Docker running containers
-            if [ -f /opt/vps-backup/data/running-containers.list ]; then
+            if [ -s /opt/vps-backup/data/running-containers.list ]; then
               sudo systemctl restart docker || true
               sleep 5
-              for c in $(cat /opt/vps-backup/data/running-containers.list); do
-                sudo docker start "$c" || true
-              done
+              while read -r c; do
+                [ -n "$c" ] && sudo docker start "$c" || true
+              done < /opt/vps-backup/data/running-containers.list
             fi
           else
             echo "No backup found, starting fresh"
@@ -106,7 +106,7 @@ jobs:
           sudo docker ps -q > /opt/vps-backup/data/running-containers.list || true
 
           echo "Backing up filesystem..."
-          sudo rsync -aAX \
+          sudo rsync -a \
             --exclude={"/opt/vps-backup","/proc/*","/sys/*","/dev/*","/tmp/*","/run/*"} \
             / /opt/vps-backup/full
 
