@@ -1,84 +1,78 @@
-name: Continuous VPS (Artifact-Based)
+name: Continuous Persistent VPS
 
 on:
-  workflow_dispatch:  # Manual trigger
-  schedule:
-    - cron: "30 */5 * * *"  # ~5h30m auto-restart
+  workflow_dispatch:
 
 jobs:
-  vps-session:
+  persistent-vps:
     runs-on: ubuntu-latest
+    timeout-minutes: 4320  # 72 hours (max allowed)
 
     steps:
-    # 1. Checkout repo
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    # 2. Install prerequisites
-    - name: Install prerequisites
-      run: |
-        sudo apt update && sudo apt upgrade -y
-        sudo apt install -y curl unzip zip rsync wget docker.io docker-compose
+      - name: Install prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch
 
-    # 3. Install Tailscale
-    - name: Install Tailscale
-      run: |
-        curl -fsSL https://tailscale.com/install.sh | sh
+      - name: Install Tailscale official script
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-    # 4. Restore backup from artifact
-    - name: Download VPS backup
-      uses: actions/download-artifact@v4
-      with:
-        name: vps-backup
-        path: ./backup || echo "No previous backup found"
+      - name: Infinite persistent loop
+        run: |
+          while true; do
+            echo "===== Starting VPS cycle ====="
 
-    - name: Extract Backup
-      run: |
-        if [ -f ./backup/backup.zip ]; then
-          unzip -o ./backup/backup.zip -d /opt/vps-backup
-        fi
+            # Set hostname
+            sudo hostnamectl set-hostname biralo
 
-    # 5. Connect Tailscale
-    - name: Connect Tailscale
-      run: |
-        sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname gha-vps --accept-routes --accept-dns --ssh || echo "Tailscale may already be up"
+            # Restore backup
+            if [ -f ./backup/backup.zip ]; then
+              echo "Restoring backup..."
+              sudo unzip -o ./backup/backup.zip -d /
+            fi
 
-    # 6. Start Playit agent
-    - name: Start Playit
-      run: |
-        if [ ! -f ./playit-linux ]; then
-          wget https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux
-          chmod +x ./playit-linux
-        fi
-        mkdir -p ~/.playit
-        cp -r /opt/vps-backup/data/playit/* ~/.playit/ || true
-        nohup ./playit-linux &>/dev/null &
+            # Restore Tailscale
+            if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+              sudo mkdir -p /var/lib/tailscale
+              sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+              sudo chmod 600 /var/lib/tailscale/tailscaled.state
+            fi
 
-    # 7. Start Docker containers
-    - name: Start Docker containers
-      run: |
-        if [ -f docker-compose.yml ]; then
-          docker-compose up -d
-        fi
+            # Start Tailscale
+            sudo tailscaled &
+            sleep 8
+            sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo || echo "Tailscale already up"
 
-    # 8. Show IPs
-    - name: Show IPs
-      run: |
-        echo "Public IP via Playit:"
-        cat ~/.playit/public-ip.txt || echo "Not found"
-        echo "Tailscale IP:"
-        tailscale ip -4
-        docker ps
+            # Create user
+            if ! id -u biralo >/dev/null 2>&1; then
+              sudo useradd -m -s /bin/bash biralo
+              echo "biralo:biralo" | sudo chpasswd
+              sudo usermod -aG sudo biralo
+              echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
+            fi
 
-    # 9. Backup VPS for next run
-    - name: Backup VPS
-      run: |
-        mkdir -p /opt/vps-backup/data/playit
-        cp -r ~/.playit/* /opt/vps-backup/data/playit/ || true
-        zip -r backup.zip /opt/vps-backup
+            # Start tmate session
+            tmux new-session -d -s vps-session
+            tmate -S /tmp/tmate.sock new-session -d
+            tmate -S /tmp/tmate.sock wait tmate-ready
+            echo "🔑 tmate SSH session:"
+            tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
 
-    - name: Upload VPS backup artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: vps-backup
-        path: backup.zip
+            # Sleep for 5.5 hours
+            sleep 19800
+
+            # Backup VPS
+            sudo mkdir -p /opt/vps-backup/data
+            sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+            sudo chown -R $USER:$USER /opt/vps-backup
+            zip -r backup.zip /opt/vps-backup
+
+            # Upload backup artifact
+            gh actions upload-artifact --name vps-backup --path backup.zip || echo "Backup upload failed"
+
+            echo "===== Cycle complete, restarting ====="
+          done
