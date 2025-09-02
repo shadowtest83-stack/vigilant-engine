@@ -1,9 +1,9 @@
-name: Continuous Persistent VPS
+name: Continuous VPS (GitHub-Hosted)
 
 on:
-  workflow_dispatch:  # manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: "30 */5 * * *"  # every 5 hours 30 minutes (UTC approximation)
+    - cron: "30 */5 * * *"  # every 5h30m (UTC approx)
 
 jobs:
   vps-session:
@@ -17,80 +17,56 @@ jobs:
     - name: Install prerequisites
       run: |
         sudo apt update && sudo apt upgrade -y
-        sudo apt install -y curl unzip zip rsync sudo net-tools software-properties-common apt-transport-https ca-certificates gnupg lsb-release wget
+        sudo apt install -y curl unzip zip rsync wget docker.io docker-compose awscli
 
-    # 3. Install Docker
-    - name: Install Docker
+    # 3. Restore backup from S3
+    - name: Download backup
       run: |
-        sudo apt-get remove -y containerd containerd.io || true
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo apt update
-        sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-        sudo systemctl enable docker
-        sudo systemctl start docker
+        mkdir -p ./backup
+        aws s3 cp s3://YOUR_BUCKET_NAME/backup.zip ./backup/backup.zip || echo "No backup found"
 
-    # 4. Restore VPS backup (must come before Tailscale/Playit)
-    - name: Download Backup
-      uses: actions/download-artifact@v4
-      with:
-        name: vps-backup
-        path: ./backup
-
-    - name: Extract Backup
+    - name: Extract backup
       run: |
         if [ -f ./backup/backup.zip ]; then
           unzip -o ./backup/backup.zip -d /opt/vps-backup
         fi
 
-    # 5. Install & Connect Tailscale
+    # 4. Install & connect Tailscale
     - name: Install Tailscale
       run: |
         curl -fsSL https://tailscale.com/install.sh | sh
-        sudo tailscale up \
-          --authkey ${{ secrets.TAILSCALE_AUTHKEY }} \
-          --hostname gha-vps \
-          --accept-routes \
-          --accept-dns \
-          --ssh || echo "Tailscale may already be connected"
+        sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname gha-vps --accept-routes --accept-dns --ssh || echo "Tailscale may already be up"
 
-    # 6. Start Playit agent
-    - name: Start Playit agent
+    # 5. Start Playit agent
+    - name: Start Playit
       run: |
         if [ ! -f ./playit-linux ]; then
           wget https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux
           chmod +x ./playit-linux
         fi
-        if [ -d /opt/vps-backup/data/playit ]; then
-          mkdir -p ~/.playit
-          cp -r /opt/vps-backup/data/playit/* ~/.playit/
-        fi
+        mkdir -p ~/.playit
+        cp -r /opt/vps-backup/data/playit/* ~/.playit/ || true
         nohup ./playit-linux &>/dev/null &
 
-    # 7. Start Docker containers
+    # 6. Start Docker containers
     - name: Start Docker containers
       run: |
         if [ -f docker-compose.yml ]; then
-          docker compose up -d
+          docker-compose up -d
         fi
 
-    # 8. Show IPs for debug
+    # 7. Show IPs
     - name: Show IPs
       run: |
-        echo "Public IPv4 via Playit:"
-        cat ~/.playit/public-ip.txt || echo "Playit IP not found"
+        echo "Public IP via Playit:"
+        cat ~/.playit/public-ip.txt || echo "Not found"
         echo "Tailscale IP:"
         tailscale ip -4
 
-    # 9. Backup VPS state for next run
+    # 8. Backup VPS to S3
     - name: Backup VPS
       run: |
         mkdir -p /opt/vps-backup/data/playit
         cp -r ~/.playit/* /opt/vps-backup/data/playit/ || true
         zip -r backup.zip /opt/vps-backup
-
-    - name: Upload Backup
-      uses: actions/upload-artifact@v4
-      with:
-        name: vps-backup
-        path: backup.zip
+        aws s3 cp backup.zip s3://YOUR_BUCKET_NAME/backup.zip
