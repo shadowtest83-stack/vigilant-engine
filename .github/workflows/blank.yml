@@ -1,83 +1,110 @@
-name: Persistent VPS
+name: Continuous Persistent VPS
 
 on:
-  workflow_dispatch:  # manual trigger
   schedule:
-    - cron: "0 */6 * * *"  # auto every 6 hours, change as needed
+    - cron: '0 */6 * * *'  # Every 6 hours auto
+  workflow_dispatch:
 
 jobs:
   vps-session:
     runs-on: ubuntu-latest
+    timeout-minutes: 350  # Just under 6 hours
+
     steps:
-
-      # 1️⃣ Checkout repo (if configs/scripts are in repo)
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # 2️⃣ Update packages
-      - name: Update & Install Dependencies
+      - name: Set hostname
+        run: sudo hostnamectl set-hostname biralo
+
+      - name: Install prerequisites
         run: |
           sudo apt update
-          sudo apt install -y curl unzip zip net-tools sudo rsync docker.io containerd
+          sudo apt install -y curl unzip sudo net-tools neofetch rsync zip software-properties-common \
+          apt-transport-https ca-certificates gnupg lsb-release
 
-      # 3️⃣ Restore Backup if exists
-      - name: Restore Backup
-        uses: actions/download-artifact@v3
+      - name: Install Docker and systemd
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt update
+          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          sudo systemctl enable docker
+          sudo systemctl start docker
+
+      - name: Restore VPS backup if exists
+        uses: actions/download-artifact@v4
         with:
           name: vps-backup
-          path: ./backup.zip
+          path: ./backup
+        continue-on-error: true
 
-      - name: Extract Backup
+      - name: Restore files
         run: |
-          if [ -f ./backup.zip ]; then
-            unzip -o ./backup.zip -d /
-            echo "Backup restored"
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /
           else
             echo "No backup found, starting fresh"
           fi
 
-      # 4️⃣ Start Playit agent (auto-claim if first run)
-      - name: Run Playit
-        run: |
-          mkdir -p ~/.playit
-          if [ ! -f ~/.playit/playit.toml ]; then
-            echo "First run: claim your Playit manually"
-            echo "Go to https://playit.gg/claim and paste token/config"
-            # You can also script auto token here if needed later
-          fi
-          # Start Playit
-          nohup ./playit &  # make sure your Playit binary/script is in repo
-          sleep 5
-          echo "Playit Public IP:"
-          grep "Tunnel:" ~/.playit/playit.log || echo "Check dashboard if not printed"
+      - name: Install Tailscale official script
+        run: curl -fsSL https://tailscale.com/install.sh | sh
 
-      # 5️⃣ Start Tailscale (auto-connect)
+      - name: Restore Tailscale state if exists
+        run: |
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+
       - name: Start Tailscale
         run: |
           sudo tailscaled &
-          sleep 5
-          sudo tailscale up --authkey your-tailscale-key --accept-routes
-          echo "Tailscale IP:"
-          tailscale ip -4
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=biralo || echo "Tailscale already up"
 
-      # 6️⃣ Start your other services
-      - name: Start VPS Services
+      - name: Create user biralo with sudo
         run: |
-          # Example: Docker containers
-          docker compose -f /home/your-vps/docker-compose.yml up -d
+          if ! id -u biralo >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash biralo
+            echo "biralo:biralo" | sudo chpasswd
+            sudo usermod -aG sudo biralo
+            echo "biralo ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/biralo
+          fi
 
-      # 7️⃣ Backup data at end
-      - name: Backup Data
+      - name: Start tmate session for SSH access
+        uses: mxschmitt/action-tmate@v3
+
+      - name: Show Tailscale IP and tmate info
         run: |
-          zip -r backup.zip /home/your-vps-data ~/.playit /var/lib/tailscale /etc/your-service
-          echo "Backup created"
+          echo "🖧 Tailscale IP:"
+          tailscale ip -4 || echo "Tailscale IP not found"
+          echo ""
+          echo "🔗 tmate SSH session:"
+          cat $HOME/.tmate.sock/ssh
 
-      - name: Upload Backup
-        uses: actions/upload-artifact@v3
+      - name: Keep VPS alive and auto-restart
+        run: |
+          while true; do
+            echo "🔄 Keeping VPS alive..."
+            sleep 19800  # 5h30m before restart
+            echo "♻️ Restarting services..."
+            sudo systemctl restart docker || true
+            sudo tailscaled || true
+            sleep 10
+          done
+
+      - name: Backup VPS data and Tailscale state
+        run: |
+          sudo mkdir -p /opt/vps-backup/data
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/ || true
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup || true
+
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
         with:
           name: vps-backup
           path: backup.zip
-
-      # ✅ Finished
-      - name: Done
-        run: echo "VPS is persistent! Playit + Tailscale running. Backup uploaded."
